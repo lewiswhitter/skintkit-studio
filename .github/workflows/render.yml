@@ -12,7 +12,7 @@ on:
       topic: {description: "Draft a free script (Gemini) for this topic, then run normally. Blank = skip.", required: false, default: ""}
       preview: {description: "Queue item slug to preview (no upload). Blank = normal run.", required: false, default: ""}
       site_only: {description: "Just rebuild + deploy the website (skip video render).", type: boolean, required: false, default: false}
-permissions: {contents: write}
+permissions: {contents: write}   # this repo: keep-alive file only; HQ is written with HQ_PAT
 concurrency: {group: studio, cancel-in-progress: false}
 jobs:
   run:
@@ -92,3 +92,10 @@ jobs:
           git commit -m "studio: run (render farm)"
           for i in 1 2 3 4 5; do git pull --rebase -q -X ours && git push && exit 0; git rebase --abort 2>/dev/null; sleep $((i * 3)); done
           exit 1
+      - name: Keep-alive (weekly, so GitHub never pauses this repo's schedules)
+        if: github.event.schedule == '53 7 * * 0'
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          sha=$(gh api repos/${{ github.repository }}/contents/heartbeat.txt --jq .sha 2>/dev/null || true)
+          gh api -X PUT repos/${{ github.repository }}/contents/heartbeat.txt -f message="keep-alive" \
+            -f content="$(date -u +%FT%TZ | base64)" ${sha:+-f sha=$sha} >/dev/null && echo "heartbeat ok"
