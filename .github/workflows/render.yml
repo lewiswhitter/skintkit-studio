@@ -1,0 +1,94 @@
+name: Studio (render farm)
+# Runs HQ Studio in this PUBLIC repo = free Actions minutes (HQ is private, 2,000/month cap).
+# All code and the video queue stay in the private HQ repo: this job checks it out with HQ_PAT and pushes results back.
+# Keys live in this repo's secrets (copied once by HQ's studio-public-setup.yml); GitHub masks them in logs.
+on:
+  schedule:
+    - {cron: "17 6 * * *"}    # Producer + Affiliate Clerk + Uploader (1 upload per run)
+    - {cron: "41 16 * * *"}   # second daily Producer run = 2 Shorts/day (Lewis, 31 Oct)
+    - {cron: "53 7 * * 0"}    # Analyst, Sundays
+  workflow_dispatch:
+    inputs:
+      topic: {description: "Draft a free script (Gemini) for this topic, then run normally. Blank = skip.", required: false, default: ""}
+      preview: {description: "Queue item slug to preview (no upload). Blank = normal run.", required: false, default: ""}
+      site_only: {description: "Just rebuild + deploy the website (skip video render).", type: boolean, required: false, default: false}
+permissions: {contents: write}
+concurrency: {group: studio, cancel-in-progress: false}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      AMAZON_TAG: ${{ secrets.AMAZON_TAG }}
+      YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+      YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+      YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+      GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+      GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+      GROK_API_KEY_2: ${{ secrets.GROK_API_KEY_2 }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GIT_AUTHOR_NAME: hq-studio
+      GIT_AUTHOR_EMAIL: hq-studio@users.noreply.github.com
+      GIT_COMMITTER_NAME: hq-studio
+      GIT_COMMITTER_EMAIL: hq-studio@users.noreply.github.com
+      PIPER_DIR: /home/runner/voices
+      KOKORO_DIR: /home/runner/kokoro
+    steps:
+      - uses: actions/checkout@v4
+        with: {repository: lewiswhitter/HQ, token: "${{ secrets.HQ_PAT }}"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - uses: actions/cache@v4
+        with: {path: /home/runner/voices, key: piper-northern-male-v1}
+      - uses: actions/cache@v4
+        with: {path: /home/runner/kokoro, key: kokoro-v1.0}
+      - uses: actions/setup-python@v5   # runner default moved to 3.14; kokoro-onnx 0.6.1 needs <3.14
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: .github/workflows/studio.yml}
+      - uses: actions/cache@v4
+        with: {path: /home/runner/.cache/ms-playwright, key: pw-chromium-1.49.1}
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core >/dev/null
+      - run: pip install -q piper-tts==1.8.0 requests==2.32.3 google-api-python-client==2.151.0 google-auth==2.36.0 pillow==11.0.0 cryptography==43.0.3 kokoro-onnx==0.6.1 playwright==1.49.1 numpy edge-tts
+      - name: Motion-graphics renderer (Chromium for studio/mg)
+        run: python -m playwright install --with-deps chromium >/dev/null
+      - run: git config --global user.name "hq-studio" && git config --global user.email "hq-studio@users.noreply.github.com"
+      - name: Free script draft (Gemini; no key = Studio Scout writes it)
+        if: inputs.topic != ''
+        run: python3 studio/draft.py "${{ inputs.topic }}" || echo "no free draft, Claude fallback"
+      - name: Analyst
+        if: github.event.schedule == '53 7 * * 0'
+        run: python3 studio/make.py stats
+      - name: Preview
+        if: inputs.preview != ''
+        run: python3 studio/make.py preview "${{ inputs.preview }}"
+        env: {HYPERFRAMES_NO_TELEMETRY: "1"}
+      - name: Producer
+        if: github.event.schedule != '53 7 * * 0' && inputs.preview == '' && !inputs.site_only
+        run: python3 studio/make.py render
+        env: {HYPERFRAMES_NO_TELEMETRY: "1"}
+      - name: Affiliate Clerk (swap approved Awin links, check dead links)
+        run: python3 studio/affiliate_clerk.py || echo 'clerk failed, site still builds'
+      - name: Site + share pack
+        run: python3 studio/web.py
+      - name: Deploy site (Cloudflare Pages; skipped until the secrets exist)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "no Cloudflare secrets: site built, not deployed"; exit 0; }
+          npx --yes wrangler@4 pages project create skintkit --production-branch=main 2>/dev/null || true
+          python3 tools/cf_analytics.py inject studio/site_out skintkit.pages.dev
+          npx --yes wrangler@4 pages deploy studio/site_out --project-name=skintkit --branch=main --commit-dirty=true
+          sh tools/www_redirect.sh skintkit
+      - name: Save
+        if: always()   # save queue state even if a step failed or the run was cancelled
+        run: |
+          git config user.name "hq-studio"; git config user.email "hq-studio@users.noreply.github.com"
+          git add studio village/board.jsonl content/affiliates
+          git diff --cached --quiet && exit 0
+          git commit -m "studio: run (render farm)"
+          for i in 1 2 3 4 5; do git pull --rebase -q -X ours && git push && exit 0; git rebase --abort 2>/dev/null; sleep $((i * 3)); done
+          exit 1
